@@ -607,6 +607,10 @@ tbody tr:hover{background:var(--gray-100);}
           <button class="set-btn" onclick="saveAppsScriptUrl()">Save URL</button>
           <button class="bulk-btn" onclick="testAppsScriptUrl()">Test Connection</button>
         </div>
+        <div style="margin-top:0.75rem;">
+          <button class="set-btn" onclick="manualSync()" style="background:var(--green);">&#8645; Manual Sync to Google Sheets</button>
+          <span id="manual-sync-status" style="font-size:0.82rem;margin-left:0.75rem;color:var(--gray-600);"></span>
+        </div>
         <p style="font-size:0.75rem;color:var(--gray-400);margin-top:0.6rem;" id="apps-script-status"></p>
       </div>
         <div class="deadline-row">
@@ -1138,47 +1142,101 @@ function completeAck() { if(!document.getElementById('ack-checkbox').checked)ret
 // ====== GOOGLE APPS SCRIPT INTEGRATION ======
 // Paste your deployed Apps Script Web App URL below after deployment
 // Leave as empty string until you have deployed your Apps Script
-var APPS_SCRIPT_URL = settings.appsScriptUrl || "";
+var APPS_SCRIPT_URL = settings.appsScriptUrl || "https://script.google.com/macros/s/AKfycbw1H5AMl7RxAPN2c8xD_kEQL__nX24y5yBZJ324UoWRKHHfuyzbBgW5SVVhR0k1aL4h/exec";
 
 function sendToGoogleSheets(record) {
   if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.trim() === "") {
-    console.log("Apps Script URL not set — record saved locally only.");
+    console.log("Apps Script URL not set.");
     return;
   }
 
+  // Store in pending queue
+  try {
+    var pending = JSON.parse(localStorage.getItem('ccsd_pending_sync') || '[]');
+    // Only add if not already queued
+    if (!pending.find(function(r){ return r.certNum === record.certNum; })) {
+      pending.push(record);
+      localStorage.setItem('ccsd_pending_sync', JSON.stringify(pending));
+    }
+  } catch(e) {}
+
   var encoded = encodeURIComponent(JSON.stringify(record));
-  var url = APPS_SCRIPT_URL + "?data=" + encoded + "&callback=handleSheetResponse";
+  var getUrl = APPS_SCRIPT_URL + "?data=" + encoded;
 
-  // JSONP approach — injects a script tag which bypasses CORS entirely
-  // This is the most reliable method from a local HTML file
-  window.handleSheetResponse = function(response) {
-    console.log("Google Sheets response:", response);
-    showToast("Record saved to Google Sheets!", true);
-    // Clean up the script tag
-    var old = document.getElementById("gs-sync-script");
-    if (old) old.parentNode.removeChild(old);
-  };
+  console.log("Attempting Google Sheets sync for:", record.name, record.certNum);
 
-  var script = document.createElement("script");
-  script.id = "gs-sync-script";
-  script.src = url;
-  script.onerror = function() {
-    console.log("Script JSONP failed — trying no-cors fetch.");
-    // Fallback — plain no-cors fetch GET
-    var plainUrl = APPS_SCRIPT_URL + "?data=" + encoded;
-    fetch(plainUrl, { mode: "no-cors" })
-      .then(function() { console.log("no-cors fetch sent."); })
-      .catch(function(e) { console.log("fetch also failed: " + e); });
-    var old = document.getElementById("gs-sync-script");
-    if (old) old.parentNode.removeChild(old);
-  };
+  // Primary method — fetch GET no-cors (most compatible from GitHub Pages)
+  fetch(getUrl, {
+    method: "GET",
+    mode: "no-cors",
+    cache: "no-cache"
+  })
+  .then(function() {
+    console.log("Sheets sync GET sent — check your Sheet.");
+    clearPendingSync(record);
+    showToast("Record sent to Google Sheets!", true);
+  })
+  .catch(function(err) {
+    console.log("GET failed: " + err);
+    // Fallback — POST with text/plain
+    fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(record),
+      mode: "cors"
+    })
+    .then(function(r) { return r.text(); })
+    .then(function(t) {
+      console.log("POST success:", t);
+      clearPendingSync(record);
+      showToast("Record saved to Google Sheets!", true);
+    })
+    .catch(function(e2) {
+      console.log("POST also failed: " + e2);
+      showToast("Use Manual Sync in Admin Settings to sync records.", false);
+    });
+  });
+}
 
-  // Remove any previous sync script first
-  var existing = document.getElementById("gs-sync-script");
-  if (existing) existing.parentNode.removeChild(existing);
+function clearPendingSync(record) {
+  try {
+    var pending = JSON.parse(localStorage.getItem('ccsd_pending_sync') || '[]');
+    pending = pending.filter(function(r) { return r.certNum !== record.certNum; });
+    localStorage.setItem('ccsd_pending_sync', JSON.stringify(pending));
+  } catch(e) {}
+}
 
-  document.body.appendChild(script);
-  console.log("Google Sheets sync initiated via JSONP script tag.");
+function manualSync() {
+  if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.trim() === "") {
+    showToast("Please save your Apps Script URL in Settings first.", false);
+    return;
+  }
+  var statusEl = document.getElementById('manual-sync-status');
+  var records = sessionLog.filter(function(r) { return r.passed; });
+  if (records.length === 0) { showToast("No completed records to sync.", false); return; }
+  var synced = 0;
+  statusEl.textContent = "Syncing " + records.length + " record(s)...";
+  statusEl.style.color = 'var(--amber)';
+  records.forEach(function(record, idx) {
+    setTimeout(function() {
+      var encoded = encodeURIComponent(JSON.stringify(record));
+      fetch(APPS_SCRIPT_URL + "?data=" + encoded, { mode: "no-cors" })
+        .then(function() {
+          synced++;
+          if (synced === records.length) {
+            statusEl.textContent = "\u2713 All " + records.length + " record(s) synced to Google Sheets!";
+            statusEl.style.color = 'var(--green)';
+            showToast("All records synced!", true);
+          } else {
+            statusEl.textContent = "Synced " + synced + " of " + records.length + "...";
+          }
+        })
+        .catch(function(e) {
+          statusEl.textContent = "Sync error: " + e;
+          statusEl.style.color = 'var(--red)';
+        });
+    }, idx * 1500);
+  });
 }
 
 // ====== COMPLETION ======
